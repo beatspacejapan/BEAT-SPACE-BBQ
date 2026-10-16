@@ -387,7 +387,7 @@ const kv=rows=>rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");
 /* ===== API: Google Apps Script when hosted there, otherwise a local preview backend ===== */
 const GAS=typeof google!=="undefined"&&google.script&&google.script.run;
 /* GitHub Pages などで公開する場合：Apps Script のウェブアプリURL（…/exec）を "" の中に貼り付けます */
-const API_URL="";
+const API_URL="https://script.google.com/macros/s/AKfycbwGXC_bx4KRtpPRoHqC9g7GKjBZQHuX4bovhAB0lgnVxMEL3ebUVF0Rl7XlF2ZBLCw2/exec";
 const REMOTE=!GAS&&!!API_URL;
 async function remote(action,args,post){
   let res;
