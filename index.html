@@ -387,7 +387,290 @@ const kv=rows=>rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");
 /* ===== API: Google Apps Script when hosted there, otherwise a local preview backend ===== */
 const GAS=typeof google!=="undefined"&&google.script&&google.script.run;
 /* GitHub Pages などで公開する場合：Apps Script のウェブアプリURL（…/exec）を "" の中に貼り付けます */
-const API_URL="";
+const API_URL="/**
+ * BEAT SPACE BBQ 予約システム（Google Apps Script）
+ * スプレッドシートの「拡張機能 > Apps Script」に貼り付けて使います。
+ * 予約は「Reservations」シートに保存されます。
+ */
+
+// ===== 設定 =====
+const CONFIG = {
+  EVENT_NAME: 'BEAT SPACE BBQ',
+  EVENT_DAY: '2026-11-01',                      // 開催日
+  CANCEL_DEADLINE: '2026-10-31T00:00:00+09:00', // この時刻より前ならサイトで変更・キャンセル可（=10/30 23:59まで）
+  PRICE: 8000,                                  // 1名あたり（現地払い）
+  DURATION: 3,                                  // 3時間制
+  START_HOURS: [13, 14, 15, 16, 17],            // 開始時刻（最終 17:00〜20:00）
+  SENDER_NAME: 'BEAT SPACE',                    // メールの差出人名
+  ORGANIZER_EMAIL: '',                          // 予約・変更・キャンセル通知を受け取るアドレス（空なら通知しない）
+  VENUE_TEXT: '',                               // メールに載せる会場・アクセス
+  CONTACT_TEXT: '045-577-9350（営業時間 11:00〜22:00）', // メールに載せるお問い合わせ先
+  SITE_URL: ''                                  // GitHub Pages で公開する場合はそのURL（例：https://ユーザー名.github.io/bbq/）。空ならApps ScriptのURLを使用
+};
+
+// 席：8名席は5〜8名、4名席は3〜4名、2名席は1〜2名
+const TABLES = (function () {
+  const t = {};
+  for (let i = 1; i <= 8; i++) t['A-' + pad(i)] = { cap: 8, min: 5 };
+  for (let i = 1; i <= 6; i++) t['B-' + pad(i)] = { cap: 4, min: 3 };
+  for (let i = 1; i <= 8; i++) t['C-' + pad(i)] = { cap: 2, min: 1 };
+  return t;
+})();
+
+const SHEET = 'Reservations';
+const HEADERS = ['予約番号', '受付日時', '席', '席タイプ', '開始', '終了', '人数', '名前', 'メール', '電話', '要望', '状態', 'キャンセル日時', 'token', '変更日時'];
+const COL = { no: 0, created: 1, table: 2, type: 3, start: 4, end: 5, people: 6, name: 7, email: 8, tel: 9, note: 10, status: 11, cancelled: 12, token: 13, changed: 14 };
+const DEADLINE_MSG = '10/31以降のため、サイトからの変更・キャンセルはできません。食材の費用を頂戴いたします。';
+
+function pad(n) { return ('0' + n).slice(-2); }
+
+// ===== Web ページ / API =====
+// ?action=getState や ?action=getReservation&token=… のときはJSONを返す（GitHub Pages版から利用）
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  if (p.action === 'getState') return json_(() => getState());
+  if (p.action === 'getReservation') return json_(() => getReservation(p.token));
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle(CONFIG.EVENT_NAME + ' 予約')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// 予約・変更・キャンセル（GitHub Pages版から POST で呼ばれる）
+function doPost(e) {
+  let body = {};
+  try { body = JSON.parse((e && e.postData && e.postData.contents) || '{}'); } catch (err) {}
+  const a = body.args || [];
+  if (body.action === 'book') return json_(() => book(a[0]));
+  if (body.action === 'change') return json_(() => change(a[0], a[1]));
+  if (body.action === 'cancel') return json_(() => cancel(a[0]));
+  return json_(() => { throw new Error('不正なリクエストです。'); });
+}
+function json_(fn) {
+  let out;
+  try { out = { ok: true, result: fn() }; } catch (err) { out = { ok: false, error: String(err && err.message || err) }; }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// 初回だけ実行：シートを作って権限を承認（作成済みでも再実行して大丈夫です）
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET);
+  if (!sh) sh = ss.insertSheet(SHEET);
+  sh.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.hideColumns(COL.token + 1);
+  MailApp.getRemainingDailyQuota(); // メール権限の承認用
+}
+
+function sheet_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET);
+  if (!sh) throw new Error('システム準備中です。しばらくしてからお試しください。');
+  return sh;
+}
+function rows_() {
+  const sh = sheet_();
+  const n = sh.getLastRow() - 1;
+  return n > 0 ? sh.getRange(2, 1, n, HEADERS.length).getValues() : [];
+}
+function slotStart_(h) { return new Date(CONFIG.EVENT_DAY + 'T' + pad(h) + ':00:00+09:00').getTime(); }
+function canEdit_() { return Date.now() < new Date(CONFIG.CANCEL_DEADLINE).getTime(); }
+function yen_(n) { return '¥' + Number(n).toLocaleString('ja-JP'); }
+function range_(h) { return h + ':00〜' + (h + CONFIG.DURATION) + ':00'; }
+function lock_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) throw new Error('ただいま混み合っています。少し待ってからもう一度お試しください。');
+  return lock;
+}
+// 席・時間・人数の共通チェック
+function checkSeat_(table, start, people) {
+  const T = TABLES[table];
+  if (!T) throw new Error('席が見つかりません。ページを再読み込みしてください。');
+  if (CONFIG.START_HOURS.indexOf(start) < 0) throw new Error('利用時間を選び直してください。');
+  if (!(people >= T.min && people <= T.cap)) throw new Error(T.cap + '名席は' + T.min + '〜' + T.cap + '名でご予約いただけます。');
+  if (Date.now() >= slotStart_(start)) throw new Error('この時間はすでに開始しています。別の時間を選んでください。');
+  return T;
+}
+function clash_(rows, table, start, skipIndex) {
+  return rows.some((r, i) => i !== skipIndex && r[COL.status] === '予約済み' && r[COL.table] === table &&
+    Math.abs(Number(r[COL.start]) - start) < CONFIG.DURATION);
+}
+
+// ===== 公開 API（google.script.run から呼ばれる）=====
+
+// 予約済みの席と時間だけを返す（個人情報は返さない）
+function getState() {
+  const occupied = rows_()
+    .filter(r => r[COL.status] === '予約済み')
+    .map(r => ({ t: r[COL.table], s: Number(r[COL.start]) }));
+  return { occupied: occupied, now: Date.now(), canCancel: canEdit_() };
+}
+
+function book(f) {
+  f = f || {};
+  const table = String(f.table || '');
+  const start = Number(f.start);
+  const people = Number(f.people);
+  const name = String(f.name || '').trim();
+  const email = String(f.email || '').trim();
+  const tel = String(f.tel || '').trim();
+  const note = String(f.note || '').trim().slice(0, 300);
+
+  const T = checkSeat_(table, start, people);
+  if (!/^[A-Za-z][A-Za-z .'\-]{0,60}$/.test(name)) throw new Error('お名前はローマ字（半角英字）で入力してください。');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('メールアドレスの形式を確認してください。');
+  if (tel.replace(/\D/g, '').length < 10) throw new Error('電話番号を入力してください。');
+
+  const lock = lock_();
+  let rec;
+  try {
+    if (clash_(rows_(), table, start, -1)) throw new Error('この席はすでに予約されています。別の席か時間を選んでください。');
+    const no = 'BBQ-' + Utilities.getUuid().replace(/-/g, '').slice(0, 5).toUpperCase();
+    const token = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '').slice(0, 8);
+    rec = [no, new Date(), table, T.cap + '名席', start, start + CONFIG.DURATION, people, name, email, "'" + tel, note, '予約済み', '', token, ''];
+    sheet_().appendRow(rec);
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
+
+  const r = toPublic_(rec);
+  sendBookedMail_(r, email, rec[COL.token]);
+  return r;
+}
+
+// メールのリンク（?c=token）から予約内容を表示
+function getReservation(token) {
+  const found = findByToken_(token);
+  if (!found) throw new Error('予約が見つかりません。メールのリンクをもう一度開いてください。');
+  const r = toPublic_(found.row);
+  r.canCancel = canEdit_() && r.status === '予約済み';
+  r.canChange = r.canCancel;
+  return r;
+}
+
+// 席・時間・人数の変更（同じリンクがそのまま使えます）
+function change(token, f) {
+  if (!canEdit_()) throw new Error(DEADLINE_MSG);
+  f = f || {};
+  const table = String(f.table || '');
+  const start = Number(f.start);
+  const people = Number(f.people);
+  const T = checkSeat_(table, start, people);
+
+  const lock = lock_();
+  let r, email, before;
+  try {
+    const rows = rows_();
+    const found = findByToken_(token, rows);
+    if (!found) throw new Error('予約が見つかりません。');
+    if (found.row[COL.status] !== '予約済み') throw new Error('この予約はキャンセルされているため変更できません。');
+    if (clash_(rows, table, start, found.index)) throw new Error('この席はすでに予約されています。別の席か時間を選んでください。');
+    before = toPublic_(found.row.slice());
+    const rowNo = found.index + 2;
+    const sh = sheet_();
+    sh.getRange(rowNo, COL.table + 1, 1, 5).setValues([[table, T.cap + '名席', start, start + CONFIG.DURATION, people]]);
+    sh.getRange(rowNo, COL.changed + 1).setValue(new Date());
+    SpreadsheetApp.flush();
+    found.row[COL.table] = table; found.row[COL.type] = T.cap + '名席';
+    found.row[COL.start] = start; found.row[COL.end] = start + CONFIG.DURATION; found.row[COL.people] = people;
+    r = toPublic_(found.row);
+    email = found.row[COL.email];
+  } finally {
+    lock.releaseLock();
+  }
+  sendChangedMail_(r, before, email, token);
+  r.canCancel = true; r.canChange = true;
+  return r;
+}
+
+function cancel(token) {
+  if (!canEdit_()) throw new Error(DEADLINE_MSG);
+  const lock = lock_();
+  let r, email;
+  try {
+    const found = findByToken_(token);
+    if (!found) throw new Error('予約が見つかりません。');
+    if (found.row[COL.status] !== '予約済み') throw new Error('この予約はすでにキャンセルされています。');
+    const sh = sheet_();
+    sh.getRange(found.index + 2, COL.status + 1).setValue('キャンセル');
+    sh.getRange(found.index + 2, COL.cancelled + 1).setValue(new Date());
+    SpreadsheetApp.flush();
+    found.row[COL.status] = 'キャンセル';
+    r = toPublic_(found.row);
+    email = found.row[COL.email];
+  } finally {
+    lock.releaseLock();
+  }
+  sendCancelledMail_(r, email);
+  return r;
+}
+
+// ===== 内部 =====
+function findByToken_(token, rows) {
+  token = String(token || '');
+  if (token.length < 20) return null;
+  rows = rows || rows_();
+  for (let i = 0; i < rows.length; i++) if (rows[i][COL.token] === token) return { row: rows[i], index: i };
+  return null;
+}
+function toPublic_(row) {
+  const people = Number(row[COL.people]);
+  return {
+    no: row[COL.no], table: row[COL.table], type: row[COL.type], start: Number(row[COL.start]),
+    people: people, total: people * CONFIG.PRICE, name: row[COL.name], status: row[COL.status]
+  };
+}
+function detail_(r) {
+  return [
+    '■ 予約番号：' + r.no,
+    '■ 日時：11月1日（日）' + range_(r.start) + '（3時間制）',
+    '■ 席：' + r.table + '（' + r.type + '）',
+    '■ 人数：' + r.people + '名',
+    '■ 参加費：' + yen_(r.total) + '（1名 ' + yen_(CONFIG.PRICE) + '・当日現地払い）'
+  ];
+}
+function footer_(lines) {
+  if (CONFIG.CONTACT_TEXT) lines.push('', '座席や食材に関するお問い合わせ：' + CONFIG.CONTACT_TEXT);
+  lines.push('', CONFIG.SENDER_NAME);
+  return lines.join('\n');
+}
+function editBlock_(token) {
+  return [
+    '【予約の変更・キャンセル】10月30日（金）23:59までは、下記リンクより席・時間・人数の変更や無料キャンセルができます。',
+    (CONFIG.SITE_URL || ScriptApp.getService().getUrl()) + '?c=' + token, '',
+    '10月31日以降はサイトからの変更・キャンセルはできません。食材の費用を頂戴いたします。'
+  ];
+}
+function notify_(subject, body) {
+  if (CONFIG.ORGANIZER_EMAIL) MailApp.sendEmail({ to: CONFIG.ORGANIZER_EMAIL, subject: subject, body: body, name: CONFIG.SENDER_NAME });
+}
+
+function sendBookedMail_(r, email, token) {
+  let lines = [r.name + ' 様', '', CONFIG.EVENT_NAME + ' のご予約ありがとうございます。', ''].concat(detail_(r), ['']);
+  if (CONFIG.VENUE_TEXT) lines.push('■ 会場：' + CONFIG.VENUE_TEXT, '');
+  lines = lines.concat(['当日は受付で予約番号をお伝えください。', ''], editBlock_(token));
+  MailApp.sendEmail({ to: email, subject: '【' + CONFIG.EVENT_NAME + '】ご予約完了 ' + r.no, body: footer_(lines), name: CONFIG.SENDER_NAME });
+  notify_('[新規予約] ' + r.no + ' ' + r.table + ' ' + range_(r.start) + ' ' + r.people + '名', r.name + ' / ' + email);
+}
+
+function sendChangedMail_(r, before, email, token) {
+  let lines = [r.name + ' 様', '', 'ご予約内容の変更を承りました。変更後の内容は以下のとおりです。', ''].concat(detail_(r), [
+    '', '（変更前：' + before.table + ' / ' + range_(before.start) + ' / ' + before.people + '名）', ''
+  ]).concat(editBlock_(token));
+  MailApp.sendEmail({ to: email, subject: '【' + CONFIG.EVENT_NAME + '】予約内容の変更 ' + r.no, body: footer_(lines), name: CONFIG.SENDER_NAME });
+  notify_('[変更] ' + r.no + ' ' + before.table + ' ' + range_(before.start) + ' → ' + r.table + ' ' + range_(r.start) + ' ' + r.people + '名', r.name);
+}
+
+function sendCancelledMail_(r, email) {
+  const lines = [r.name + ' 様', '', '以下のご予約のキャンセルを承りました。キャンセル料はかかりません。', '',
+    '■ 予約番号：' + r.no,
+    '■ 日時：11月1日（日）' + range_(r.start),
+    '■ 席：' + r.table + '（' + r.type + '） / ' + r.people + '名', '',
+    'またのご参加をお待ちしています。'];
+  MailApp.sendEmail({ to: email, subject: '【' + CONFIG.EVENT_NAME + '】キャンセル完了 ' + r.no, body: footer_(lines), name: CONFIG.SENDER_NAME });
+  notify_('[キャンセル] ' + r.no + ' ' + r.table + ' ' + range_(r.start), r.name);
+}";
 const REMOTE=!GAS&&!!API_URL;
 async function remote(action,args,post){
   let res;
